@@ -1,6 +1,6 @@
 pragma solidity ^0.8.4;
 
-import "../utils/BytesUtils.sol";
+import "../dnssec-oracle/BytesUtils.sol";
 import "./PublicSuffixList.sol";
 
 /**

@@ -1,7 +1,7 @@
 pragma solidity ^0.8.4;
 
 import "./Digest.sol";
-import "../../utils/BytesUtils.sol";
+import "../BytesUtils.sol";
 
 /**
  * @dev Implements the DNSSEC SHA256 digest.
