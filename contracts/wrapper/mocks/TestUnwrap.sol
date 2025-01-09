@@ -2,14 +2,14 @@
 pragma solidity ^0.8.4;
 import "../../registry/ENS.sol";
 import "../../ethregistrar/IBaseRegistrar.sol";
-import {BytesUtils} from "../../utils/BytesUtils.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {BytesUtils} from "../BytesUtils.sol";
 
 contract TestUnwrap is Ownable {
     using BytesUtils for bytes;
 
-    bytes32 private constant ETH_NODE =
-        0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae;
+    bytes32 private constant LINEA_ETH_NODE =
+        0x527aac89ac1d1de5dd84cff89ec92c69b028ce9ce3fa3d654882474ab4402ec3;
 
     ENS public immutable ens;
     IBaseRegistrar public immutable registrar;
@@ -27,7 +27,7 @@ contract TestUnwrap is Ownable {
         approvedWrapper[wrapper] = approved;
     }
 
-    function wrapETH2LD(
+    function wrapAnyLD(
         string calldata label,
         address wrappedOwner,
         uint32 fuses,
@@ -62,7 +62,7 @@ contract TestUnwrap is Ownable {
         bytes32 parentNode = name.namehash(offset);
         bytes32 node = _makeNode(parentNode, labelhash);
 
-        if (parentNode == ETH_NODE) {
+        if (parentNode == LINEA_ETH_NODE) {
             _unwrapETH2LD(labelhash, wrappedOwner, msg.sender);
         } else {
             _unwrapSubnode(node, wrappedOwner, msg.sender);

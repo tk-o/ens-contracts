@@ -1,20 +1,21 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ~0.8.17;
 
-import {ERC1155Fuse, IERC165, IERC1155MetadataURI} from "./ERC1155Fuse.sol";
+import {ERC1155Fuse, IERC1155MetadataURI} from "./ERC1155Fuse.sol";
 import {Controllable} from "./Controllable.sol";
-import {INameWrapper, CANNOT_UNWRAP, CANNOT_BURN_FUSES, CANNOT_TRANSFER, CANNOT_SET_RESOLVER, CANNOT_SET_TTL, CANNOT_CREATE_SUBDOMAIN, CANNOT_APPROVE, PARENT_CANNOT_CONTROL, CAN_DO_EVERYTHING, IS_DOT_ETH, CAN_EXTEND_EXPIRY, PARENT_CONTROLLED_FUSES, USER_SETTABLE_FUSES} from "./INameWrapper.sol";
+import {INameWrapper, CANNOT_UNWRAP, CANNOT_BURN_FUSES, CANNOT_TRANSFER, CANNOT_SET_RESOLVER, CANNOT_SET_TTL, CANNOT_CREATE_SUBDOMAIN, CANNOT_APPROVE, PARENT_CANNOT_CONTROL, IS_DOT_ETH, CAN_EXTEND_EXPIRY, PARENT_CONTROLLED_FUSES, USER_SETTABLE_FUSES} from "./INameWrapper.sol";
 import {INameWrapperUpgrade} from "./INameWrapperUpgrade.sol";
 import {IMetadataService} from "./IMetadataService.sol";
 import {ENS} from "../registry/ENS.sol";
-import {IReverseRegistrar} from "../reverseRegistrar/IReverseRegistrar.sol";
 import {ReverseClaimer} from "../reverseRegistrar/ReverseClaimer.sol";
 import {IBaseRegistrar} from "../ethregistrar/IBaseRegistrar.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {BytesUtils} from "../utils/BytesUtils.sol";
+import {BytesUtils} from "./BytesUtils.sol";
 import {ERC20Recoverable} from "../utils/ERC20Recoverable.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
+import "hardhat/console.sol";
 
 error Unauthorised(bytes32 node, address addr);
 error IncompatibleParent();
@@ -27,7 +28,16 @@ error CannotUpgrade();
 error OperationProhibited(bytes32 node);
 error NameIsNotWrapped();
 error NameIsStillExpired();
+error EmptyDataNotAllowed();
+error EmptyStringNotAllowed();
+error DifferentBaseNodeBaseNodeDnsEncoded();
+error BaseNodeAsETHNodeOrROOTNodeNotAllowed();
 
+/**
+ * @title Contract based on ENS's NameWrapper contract to handle any level
+ * domain registration instead of only 2 levels domain .eth domains.
+ * @author ConsenSys Software Inc.
+ */
 contract NameWrapper is
     Ownable,
     ERC1155Fuse,
@@ -56,17 +66,48 @@ contract NameWrapper is
     INameWrapperUpgrade public upgradeContract;
     uint64 private constant MAX_EXPIRY = type(uint64).max;
 
+    /// @dev Base node handled to register a domain, replaces .eth node
+    bytes32 public immutable baseNode;
+
+    /**
+     * @dev Ensures the data are not empty(length == 0).
+     * @param  _data to check.
+     */
+    modifier nonEmptyBytes(bytes memory _data) {
+        if (_data.length == 0) revert EmptyDataNotAllowed();
+        _;
+    }
+
     constructor(
         ENS _ens,
         IBaseRegistrar _registrar,
-        IMetadataService _metadataService
-    ) ReverseClaimer(_ens, msg.sender) {
+        IMetadataService _metadataService,
+        bytes32 _baseNode,
+        bytes memory _baseNodeDnsEncoded
+    ) nonEmptyBytes(_baseNodeDnsEncoded) ReverseClaimer(_ens, msg.sender) {
+        // Base node can not be ETH_NODE or ROOT_NODE
+        if (_baseNode == ROOT_NODE || _baseNode == ETH_NODE) {
+            revert BaseNodeAsETHNodeOrROOTNodeNotAllowed();
+        }
+
+        // Check that _baseNode and _baseNodeDnsEncoded match
+        if (_baseNodeDnsEncoded.namehash(0) != _baseNode) {
+            revert DifferentBaseNodeBaseNodeDnsEncoded();
+        }
+
         ens = _ens;
         registrar = _registrar;
         metadataService = _metadataService;
+        baseNode = _baseNode;
 
-        /* Burn PARENT_CANNOT_CONTROL and CANNOT_UNWRAP fuses for ROOT_NODE and ETH_NODE and set expiry to max */
+        /* Burn PARENT_CANNOT_CONTROL and CANNOT_UNWRAP fuses for ROOT_NODE, ETH_NODE and baseNode and set expiry to max */
 
+        _setData(
+            uint256(_baseNode),
+            address(0),
+            uint32(PARENT_CANNOT_CONTROL | CANNOT_UNWRAP),
+            MAX_EXPIRY
+        );
         _setData(
             uint256(ETH_NODE),
             address(0),
@@ -81,6 +122,7 @@ contract NameWrapper is
         );
         names[ROOT_NODE] = "\x00";
         names[ETH_NODE] = "\x03eth\x00";
+        names[_baseNode] = _baseNodeDnsEncoded;
     }
 
     function supportsInterface(
@@ -96,7 +138,7 @@ contract NameWrapper is
 
     /**
      * @notice Gets the owner of a name
-     * @param id Label as a string of the .eth domain to wrap
+     * @param id Label as a string of the domain to wrap
      * @return owner The owner of the name
      */
 
@@ -268,15 +310,15 @@ contract NameWrapper is
     }
 
     /**
-     * @notice Wraps a .eth domain, creating a new token and sending the original ERC721 token to this contract
-     * @dev Can be called by the owner of the name on the .eth registrar or an authorised caller on the registrar
-     * @param label Label as a string of the .eth domain to wrap
+     * @notice Wraps a domain based on the baseNode, creating a new token and sending the original ERC721 token to this contract
+     * @dev Can be called by the owner of the name on the registrar or an authorised caller on the registrar
+     * @param label Label as a string of the domain to wrap
      * @param wrappedOwner Owner of the name in this contract
      * @param ownerControlledFuses Initial owner-controlled fuses to set
      * @param resolver Resolver contract address
      */
 
-    function wrapETH2LD(
+    function wrapAnyLD(
         string calldata label,
         address wrappedOwner,
         uint16 ownerControlledFuses,
@@ -289,7 +331,7 @@ contract NameWrapper is
             !registrar.isApprovedForAll(registrant, msg.sender)
         ) {
             revert Unauthorised(
-                _makeNode(ETH_NODE, bytes32(tokenId)),
+                _makeNode(baseNode, bytes32(tokenId)),
                 msg.sender
             );
         }
@@ -300,29 +342,25 @@ contract NameWrapper is
         // transfer the ens record back to the new owner (this contract)
         registrar.reclaim(tokenId, address(this));
 
-        expiry = uint64(registrar.nameExpires(tokenId)) + GRACE_PERIOD;
+        expiry =
+            SafeCast.toUint64(registrar.nameExpires(tokenId)) +
+            GRACE_PERIOD;
 
-        _wrapETH2LD(
-            label,
-            wrappedOwner,
-            ownerControlledFuses,
-            expiry,
-            resolver
-        );
+        _wrap(label, wrappedOwner, ownerControlledFuses, expiry, resolver);
     }
 
     /**
-     * @dev Registers a new .eth second-level domain and wraps it.
+     * @dev Registers a new domain and wraps it.
      *      Only callable by authorised controllers.
-     * @param label The label to register (Eg, 'foo' for 'foo.eth').
+     * @param label The label to register (Eg, 'foo' for 'foo.linea.eth').
      * @param wrappedOwner The owner of the wrapped name.
      * @param duration The duration, in seconds, to register the name for.
      * @param resolver The resolver address to set on the ENS registry (optional).
      * @param ownerControlledFuses Initial owner-controlled fuses to set
-     * @return registrarExpiry The expiry date of the new name on the .eth registrar, in seconds since the Unix epoch.
+     * @return registrarExpiry The expiry date of the new name on the registrar, in seconds since the Unix epoch.
      */
 
-    function registerAndWrapETH2LD(
+    function registerAndWrap(
         string calldata label,
         address wrappedOwner,
         uint256 duration,
@@ -331,28 +369,29 @@ contract NameWrapper is
     ) external onlyController returns (uint256 registrarExpiry) {
         uint256 tokenId = uint256(keccak256(bytes(label)));
         registrarExpiry = registrar.register(tokenId, address(this), duration);
-        _wrapETH2LD(
+
+        _wrap(
             label,
             wrappedOwner,
             ownerControlledFuses,
-            uint64(registrarExpiry) + GRACE_PERIOD,
+            SafeCast.toUint64(registrarExpiry) + GRACE_PERIOD,
             resolver
         );
     }
 
     /**
-     * @notice Renews a .eth second-level domain.
+     * @notice Renews a domain.
      * @dev Only callable by authorised controllers.
-     * @param tokenId The hash of the label to register (eg, `keccak256('foo')`, for 'foo.eth').
+     * @param tokenId The hash of the label to register (eg, `keccak256('foo')`, for 'foo.linea.eth').
      * @param duration The number of seconds to renew the name for.
-     * @return expires The expiry date of the name on the .eth registrar, in seconds since the Unix epoch.
+     * @return expires The expiry date of the name on the registrar, in seconds since the Unix epoch.
      */
 
     function renew(
         uint256 tokenId,
         uint256 duration
     ) external onlyController returns (uint256 expires) {
-        bytes32 node = _makeNode(ETH_NODE, bytes32(tokenId));
+        bytes32 node = _makeNode(baseNode, bytes32(tokenId));
 
         uint256 registrarExpiry = registrar.renew(tokenId, duration);
 
@@ -369,7 +408,7 @@ contract NameWrapper is
         }
 
         // Set expiry in Wrapper
-        uint64 expiry = uint64(registrarExpiry) + GRACE_PERIOD;
+        uint64 expiry = SafeCast.toUint64(registrarExpiry) + GRACE_PERIOD;
 
         // Use super to allow names expired on the wrapper, but not expired on the registrar to renew()
         (address owner, uint32 fuses, ) = super.getData(uint256(node));
@@ -379,7 +418,7 @@ contract NameWrapper is
     }
 
     /**
-     * @notice Wraps a non .eth domain, of any kind. Could be a DNSSEC name vitalik.xyz or a subdomain
+     * @notice Wraps a domain not based on baseNode. Could be a DNSSEC name vitalik.xyz or a subdomain
      * @dev Can be called by the owner in the registry or an authorised caller in the registry
      * @param name The name to wrap, in DNS format
      * @param wrappedOwner Owner of the name in this contract
@@ -397,7 +436,7 @@ contract NameWrapper is
 
         names[node] = name;
 
-        if (parentNode == ETH_NODE) {
+        if (parentNode == baseNode) {
             revert IncompatibleParent();
         }
 
@@ -417,22 +456,22 @@ contract NameWrapper is
     }
 
     /**
-     * @notice Unwraps a .eth domain. e.g. vitalik.eth
+     * @notice Unwraps a domain based on baseNode. e.g. vitalik.linea.eth
      * @dev Can be called by the owner in the wrapper or an authorised caller in the wrapper
-     * @param labelhash Labelhash of the .eth domain
-     * @param registrant Sets the owner in the .eth registrar to this address
+     * @param labelhash Labelhash of the domain
+     * @param registrant Sets the owner in the registrar to this address
      * @param controller Sets the owner in the registry to this address
      */
 
-    function unwrapETH2LD(
+    function unwrapAnyLD(
         bytes32 labelhash,
         address registrant,
         address controller
-    ) public onlyTokenOwner(_makeNode(ETH_NODE, labelhash)) {
+    ) public onlyTokenOwner(_makeNode(baseNode, labelhash)) {
         if (registrant == address(this)) {
             revert IncorrectTargetOwner(registrant);
         }
-        _unwrap(_makeNode(ETH_NODE, labelhash), controller);
+        _unwrap(_makeNode(baseNode, labelhash), controller);
         registrar.safeTransferFrom(
             address(this),
             registrant,
@@ -441,7 +480,7 @@ contract NameWrapper is
     }
 
     /**
-     * @notice Unwraps a non .eth domain, of any kind. Could be a DNSSEC name vitalik.xyz or a subdomain
+     * @notice Unwraps a domain not based on baseNode, of any kind. Could be a DNSSEC name vitalik.xyz or a subdomain
      * @dev Can be called by the owner in the wrapper or an authorised caller in the wrapper
      * @param parentNode Parent namehash of the name e.g. vitalik.xyz would be namehash('xyz')
      * @param labelhash Labelhash of the name, e.g. vitalik.xyz would be keccak256('vitalik')
@@ -453,7 +492,7 @@ contract NameWrapper is
         bytes32 labelhash,
         address controller
     ) public onlyTokenOwner(_makeNode(parentNode, labelhash)) {
-        if (parentNode == ETH_NODE) {
+        if (parentNode == baseNode) {
             revert IncompatibleParent();
         }
         if (controller == address(0x0) || controller == address(this)) {
@@ -855,7 +894,7 @@ contract NameWrapper is
     ) public view returns (bool) {
         bytes32 node = _makeNode(parentNode, labelhash);
         bool wrapped = _isWrapped(node);
-        if (parentNode != ETH_NODE) {
+        if (parentNode != baseNode) {
             return wrapped;
         }
         try registrar.ownerOf(uint256(labelhash)) returns (address owner) {
@@ -893,9 +932,10 @@ contract NameWrapper is
         // transfer the ens record back to the new owner (this contract)
         registrar.reclaim(uint256(labelhash), address(this));
 
-        uint64 expiry = uint64(registrar.nameExpires(tokenId)) + GRACE_PERIOD;
+        uint64 expiry = SafeCast.toUint64(registrar.nameExpires(tokenId)) +
+            GRACE_PERIOD;
 
-        _wrapETH2LD(label, owner, ownerControlledFuses, expiry, resolver);
+        _wrap(label, owner, ownerControlledFuses, expiry, resolver);
 
         return IERC721Receiver(to).onERC721Received.selector;
     }
@@ -1083,7 +1123,7 @@ contract NameWrapper is
         return expiry;
     }
 
-    function _wrapETH2LD(
+    function _wrap(
         string memory label,
         address wrappedOwner,
         uint32 fuses,
@@ -1091,9 +1131,9 @@ contract NameWrapper is
         address resolver
     ) private {
         bytes32 labelhash = keccak256(bytes(label));
-        bytes32 node = _makeNode(ETH_NODE, labelhash);
+        bytes32 node = _makeNode(baseNode, labelhash);
         // hardcode dns-encoded eth string for gas savings
-        bytes memory name = _addLabel(label, "\x03eth\x00");
+        bytes memory name = _addLabel(label, names[baseNode]);
         names[node] = name;
 
         _wrap(

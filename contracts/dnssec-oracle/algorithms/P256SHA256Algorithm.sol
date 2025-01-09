@@ -2,7 +2,7 @@ pragma solidity ^0.8.4;
 
 import "./Algorithm.sol";
 import "./EllipticCurve.sol";
-import "../../utils/BytesUtils.sol";
+import "../BytesUtils.sol";
 
 contract P256SHA256Algorithm is Algorithm, EllipticCurve {
     using BytesUtils for *;

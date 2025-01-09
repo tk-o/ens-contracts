@@ -1,7 +1,6 @@
-//SPDX-License-Identifier: MIT
 pragma solidity ^0.8.4;
 
-import "../utils/BytesUtils.sol";
+import "./BytesUtils.sol";
 import "@ensdomains/buffer/contracts/Buffer.sol";
 
 /**
